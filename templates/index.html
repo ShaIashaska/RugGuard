@@ -74,6 +74,13 @@
   .verdict{font-family:var(--display);font-weight:700;font-size:26px;margin:4px 0 6px}
   .advice{color:var(--muted);font-size:14.5px}
 
+  .warn{margin-top:20px;background:rgba(229,87,78,.12);border:1px solid var(--red);
+    border-radius:12px;padding:14px 16px;color:#f3b0ab;font-size:14.5px;
+    display:flex;gap:11px;align-items:flex-start;line-height:1.55}
+  .warnmark{width:20px;height:20px;border-radius:50%;background:var(--red);color:#0c0f16;
+    font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;
+    font-size:13px;margin-top:1px}
+
   .status{display:flex;gap:10px;flex-wrap:wrap;margin-top:24px}
   .pill{flex:1;min-width:150px;background:var(--panel2);border:1px solid var(--border);
     border-radius:12px;padding:14px}
@@ -239,12 +246,23 @@ function render(data){
   const el = document.getElementById('result');
   if(data.error){ el.innerHTML = '<div class="err">'+esc(data.error)+'</div>'; return; }
   const vs = verdictStyle(data.verdict);
+  const honeypotFlagged = (data.flags||[]).some(f => /honeypot|cannot sell|sell restriction/i.test(f.label));
+  const isHigh = data.verdict.indexOf('HIGH') > -1;
   let html = '<div class="card">';
 
   html += '<div class="top">'+ ring(data.score, vs.color) +
     '<div class="meta"><div class="tname">'+esc(data.name)+' · '+esc(data.symbol)+'</div>'+
     '<div class="verdict" style="color:'+vs.color+'">'+vs.label+'</div>'+
     '<div class="advice">'+esc(data.advice)+'</div></div></div>';
+
+  if(honeypotFlagged){
+    html += '<div class="warn"><span class="warnmark">!</span><span>Confirmed honeypot. '+
+      'You would not be able to sell these tokens, so the passing checks below do not '+
+      'make this token safe.</span></div>';
+  } else if(isHigh){
+    html += '<div class="warn"><span class="warnmark">!</span><span>High risk. Passing some '+
+      'individual checks does not mean this token is safe.</span></div>';
+  }
 
   if(data.status && data.status.length){
     html += '<div class="status">'+ data.status.map(statusPill).join('') +'</div>';
@@ -259,7 +277,6 @@ function render(data){
     cell('Liquidity locked', s.lp_secured_percent!=null? s.lp_secured_percent+'%':'n/a')+
     '</div>';
 
-  const honeypotFlagged = (data.flags||[]).some(f => /honeypot|cannot sell|sell restriction|blacklist/i.test(f.label));
   CATS.forEach(c => html += group(c, data.flags||[], data.code_status, data.code_detail, honeypotFlagged));
 
   html += '</div>';
