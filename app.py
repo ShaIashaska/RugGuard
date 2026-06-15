@@ -1,31 +1,3 @@
-#!/usr/bin/env python3
-"""
-RugGuard - A Rug Pull Detection Tool (Backend)
-==============================================
-Implementation of the detection framework from the thesis:
-  "The Psychology of Rug Pulls in Web3: A Socio-Technical Analysis"
-  Section 4.5 - Detection Framework
-
-You paste ONE token contract address. The backend then:
-  1. Pulls live on-chain security data (GoPlus API) - contract controls,
-     liquidity lock, and holder/tokenomics signals.
-  2. Auto-fetches the contract's verified source code (Etherscan V2 API) and
-     scans it for dangerous code patterns (e.g. the SQUID approveTo/ifSir
-     upgrade gate and the delegatecall proxy). If the contract is a proxy, it
-     also fetches and scans the hidden implementation contract.
-  3. Combines everything into ONE risk score, with every red flag mapped to a
-     section of the thesis.
-
-Chains supported: BNB Smart Chain (BSC) and Ethereum.
-
-Data sources (both free):
-  - GoPlus Token Security API  (no key required)
-  - Etherscan V2 API           (one free key, works for BSC + ETH)
-
-Run locally:
-  python app.py            -> http://127.0.0.1:5000
-"""
-
 import os
 import re
 import json
@@ -37,95 +9,102 @@ from flask import Flask, request, jsonify, render_template
 
 app = Flask(__name__)
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-# Paste your free Etherscan API key between the quotes below, OR set an
-# environment variable called ETHERSCAN_API_KEY. The environment variable
-# wins if both are set. Without a key, on-chain checks still run, but the
-# automatic code analysis is skipped.
 ETHERSCAN_API_KEY = os.environ.get("ETHERSCAN_API_KEY", "")
 
-# Chains supported: BSC and Ethereum only.
-CHAINS = {
-    "ethereum": "1",
-    "bsc": "56",
-}
+CHAINS = {"ethereum": "1", "bsc": "56"}
 
 GOPLUS_URL = ("https://api.gopluslabs.io/api/v1/token_security/"
               "{chain_id}?contract_addresses={address}")
 ETHERSCAN_URL = "https://api.etherscan.io/v2/api"
 
-
-# ===========================================================================
-# CATEGORY LABELS (used to group findings in the UI)
-# ===========================================================================
 CAT_CONTRACT = "Contract & team control"
 CAT_TOKENOMICS = "Tokenomics & holders"
 CAT_LIQUIDITY = "Liquidity"
 CAT_CODE = "Contract code"
 
+SEVERITY_POINTS = {"critical": 45, "high": 22, "medium": 11, "low": 5}
 
-# ===========================================================================
-# PART 1 - ON-CHAIN CHECKS (GoPlus)
-# ===========================================================================
-# Each rule maps one field from the GoPlus API to a red flag in the thesis.
-# ---------------------------------------------------------------------------
-TECHNICAL_RULES = [
-    {"key": "is_honeypot", "trigger": "1", "weight": 40, "cat": CAT_CONTRACT,
-     "label": "Honeypot: buyers are blocked from selling",
-     "thesis": "Sec 4.1 - SQUID honeypot sell restriction"},
+BURN_ADDRESSES = {
+    "0x0000000000000000000000000000000000000000",
+    "0x000000000000000000000000000000000000dead",
+}
 
-    {"key": "cannot_sell_all", "trigger": "1", "weight": 30, "cat": CAT_CONTRACT,
-     "label": "Sell restriction: holders cannot sell all of their tokens",
-     "thesis": "Sec 4.1.1 - SQUID transfer mechanism blocked selling"},
+RULES = [
+    {"key": "is_honeypot", "trigger": "1", "sev": "critical",
+     "name": "honeypot", "cat": CAT_CONTRACT,
+     "label": "Honeypot: buyers are blocked from selling"},
 
-    {"key": "cannot_buy", "trigger": "1", "weight": 12, "cat": CAT_CONTRACT,
-     "label": "Buy restriction present",
-     "thesis": "Sec 2.2 - honeypot mechanics"},
+    {"key": "cannot_sell_all", "trigger": "1", "sev": "critical",
+     "name": "sell restriction", "cat": CAT_CONTRACT,
+     "label": "Sell restriction: holders cannot sell all of their tokens"},
 
-    {"key": "is_open_source", "trigger": "0", "weight": 20, "cat": CAT_CONTRACT,
-     "label": "Contract source code is NOT verified / readable",
-     "thesis": "Sec 4.5 - unverified contract red flag"},
+    {"key": "owner_change_balance", "trigger": "1", "sev": "critical",
+     "name": "balance control", "cat": CAT_CONTRACT,
+     "label": "The owner can change any wallet's balance at will"},
 
-    {"key": "is_proxy", "trigger": "1", "weight": 10, "cat": CAT_CONTRACT,
-     "label": "Proxy contract: real logic can be hidden and swapped",
-     "thesis": "Sec 4.1.1 - SQUID proxy obfuscation (approveTo/ifSir)"},
+    {"key": "cannot_buy", "trigger": "1", "sev": "medium",
+     "name": "buy restriction", "cat": CAT_CONTRACT,
+     "label": "Buying this token is restricted"},
 
-    {"key": "is_mintable", "trigger": "1", "weight": 15, "cat": CAT_CONTRACT,
-     "label": "Mint function present: supply can be inflated",
-     "thesis": "Sec 2.2 - hidden-mint hard rug pull"},
+    {"key": "is_open_source", "trigger": "0", "sev": "high",
+     "name": "source verification", "cat": CAT_CONTRACT,
+     "label": "The contract is not verified, so its code cannot be read"},
 
-    {"key": "can_take_back_ownership", "trigger": "1", "weight": 15,
-     "cat": CAT_CONTRACT,
-     "label": "Ownership can be reclaimed by the deployer",
-     "thesis": "Sec 4.1.1 - admin-only privileged control"},
+    {"key": "is_proxy", "trigger": "1", "sev": "medium",
+     "name": "proxy", "cat": CAT_CONTRACT,
+     "label": "Proxy contract: the real logic can be hidden and swapped later"},
 
-    {"key": "hidden_owner", "trigger": "1", "weight": 15, "cat": CAT_CONTRACT,
-     "label": "Hidden owner address",
-     "thesis": "Sec 4.5 - concealed control"},
+    {"key": "is_mintable", "trigger": "1", "sev": "high",
+     "name": "mint function", "cat": CAT_CONTRACT,
+     "label": "The team can mint new tokens and inflate the supply"},
 
-    {"key": "owner_change_balance", "trigger": "1", "weight": 20,
-     "cat": CAT_CONTRACT,
-     "label": "Owner can change wallet balances arbitrarily",
-     "thesis": "Sec 4.5 - privileged control over funds"},
+    {"key": "can_take_back_ownership", "trigger": "1", "sev": "high",
+     "name": "ownership reclaim", "cat": CAT_CONTRACT,
+     "label": "Ownership can be reclaimed by the deployer after being given up"},
 
-    {"key": "selfdestruct", "trigger": "1", "weight": 15, "cat": CAT_CONTRACT,
-     "label": "Contract can self-destruct",
-     "thesis": "Sec 4.5 - technical red flag"},
+    {"key": "hidden_owner", "trigger": "1", "sev": "high",
+     "name": "hidden owner", "cat": CAT_CONTRACT,
+     "label": "The contract has a hidden owner address"},
 
-    {"key": "transfer_pausable", "trigger": "1", "weight": 10, "cat": CAT_CONTRACT,
-     "label": "Transfers can be paused by the team",
-     "thesis": "Sec 2.2 - team control over trading"},
+    {"key": "selfdestruct", "trigger": "1", "sev": "high",
+     "name": "self-destruct", "cat": CAT_CONTRACT,
+     "label": "The contract can destroy itself"},
 
-    {"key": "is_blacklisted", "trigger": "1", "weight": 12, "cat": CAT_CONTRACT,
-     "label": "Blacklist mechanism: wallets can be blocked from selling",
-     "thesis": "Sec 2.2 - honeypot / sell-block mechanics"},
+    {"key": "transfer_pausable", "trigger": "1", "sev": "medium",
+     "name": "pausable transfers", "cat": CAT_CONTRACT,
+     "label": "The team can pause all transfers and trading"},
+
+    {"key": "is_blacklisted", "trigger": "1", "sev": "high",
+     "name": "blacklist", "cat": CAT_CONTRACT,
+     "label": "The team can blacklist wallets and block them from selling"},
+
+    {"key": "honeypot_with_same_creator", "trigger": "1", "sev": "high",
+     "name": "creator history", "cat": CAT_CONTRACT,
+     "label": "The creator has deployed other honeypot tokens before"},
+
+    {"key": "is_airdrop_scam", "trigger": "1", "sev": "high",
+     "name": "airdrop scam", "cat": CAT_CONTRACT,
+     "label": "This token has been flagged as an airdrop scam"},
+
+    {"key": "external_call", "trigger": "1", "sev": "medium",
+     "name": "external calls", "cat": CAT_CONTRACT,
+     "label": "The contract makes external calls that can change its behaviour"},
+
+    {"key": "slippage_modifiable", "trigger": "1", "sev": "medium",
+     "name": "changeable tax", "cat": CAT_CONTRACT,
+     "label": "The trading tax can be changed by the team at any time"},
+
+    {"key": "trading_cooldown", "trigger": "1", "sev": "low",
+     "name": "trading cooldown", "cat": CAT_CONTRACT,
+     "label": "A trading cooldown can delay how soon you are allowed to sell"},
+
+    {"key": "anti_whale_modifiable", "trigger": "1", "sev": "low",
+     "name": "changeable max limit", "cat": CAT_CONTRACT,
+     "label": "The maximum transaction size can be changed by the team"},
 ]
 
 
 def fetch_token(chain_id, address):
-    """Call the GoPlus API. Returns (token_dict, error_string)."""
     url = GOPLUS_URL.format(chain_id=chain_id, address=address)
     req = urllib.request.Request(url, headers={"User-Agent": "RugGuard/1.0"})
     try:
@@ -133,48 +112,15 @@ def fetch_token(chain_id, address):
             data = json.loads(resp.read().decode())
     except urllib.error.URLError as e:
         return None, f"Could not reach the security API: {e}"
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         return None, f"Unexpected error: {e}"
-
     if data.get("code") != 1:
         return None, f"API error: {data.get('message', 'unknown')}"
-
     token = (data.get("result") or {}).get(address.lower())
     if not token:
-        return None, ("No data for this address. It may not be a token, "
-                      "or it is too new to be indexed yet.")
+        return None, ("No data for this address. It may not be a token, or it "
+                      "is too new to be indexed yet.")
     return token, None
-
-
-def top_holder_concentration(token):
-    """Top-10 holder concentration (insider / whale signal)."""
-    holders = token.get("holders") or []
-    pcts = []
-    for h in holders:
-        try:
-            v = float(h.get("percent", 0))
-            if math.isfinite(v):
-                pcts.append(v)
-        except (TypeError, ValueError):
-            continue
-    pcts.sort(reverse=True)
-    return round(sum(pcts[:10]) * 100, 2)
-
-
-def check_lp_lock(token):
-    """Liquidity-pool lock check (AnubisDAO pattern). Returns locked %."""
-    holders = token.get("lp_holders") or []
-    if not holders:
-        return None
-    locked = 0.0
-    for h in holders:
-        try:
-            v = float(h.get("percent", 0))
-            if str(h.get("is_locked")) == "1" and math.isfinite(v):
-                locked += v * 100
-        except (TypeError, ValueError):
-            continue
-    return round(locked, 2)
 
 
 def pct(token, key):
@@ -188,155 +134,203 @@ def pct(token, key):
         return None
 
 
+def top_holder_concentration(token):
+    holders = token.get("holders") or []
+    pcts = []
+    for h in holders:
+        try:
+            v = float(h.get("percent", 0))
+            if math.isfinite(v):
+                pcts.append(v)
+        except (TypeError, ValueError):
+            continue
+    pcts.sort(reverse=True)
+    return round(sum(pcts[:10]) * 100, 2)
+
+
+def lp_holder_pct(token, want):
+    holders = token.get("lp_holders") or []
+    if not holders:
+        return None
+    total = 0.0
+    for h in holders:
+        try:
+            v = float(h.get("percent", 0))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(v):
+            continue
+        addr = (h.get("address") or "").lower()
+        tag = (h.get("tag") or "").lower()
+        burned = addr in BURN_ADDRESSES or "burn" in tag or "null" in tag
+        locked = str(h.get("is_locked")) == "1"
+        if want == "burned" and burned:
+            total += v * 100
+        elif want == "locked" and locked and not burned:
+            total += v * 100
+        elif want == "secured" and (locked or burned):
+            total += v * 100
+    return round(total, 2)
+
+
+def yesno(condition):
+    if condition is None:
+        return "unknown"
+    return "yes" if condition else "no"
+
+
 def assess_token(token):
-    """Build the on-chain part: flags (categorized), stats, unknown fields."""
     flags = []
     unknown = []
 
-    for rule in TECHNICAL_RULES:
+    for rule in RULES:
         val = token.get(rule["key"])
         if val is None or val == "":
-            unknown.append(rule["label"])
+            unknown.append(rule["name"])
             continue
         if str(val) == rule["trigger"]:
-            flags.append({"label": rule["label"], "weight": rule["weight"],
-                          "thesis": rule["thesis"], "category": rule["cat"]})
+            flags.append({"label": rule["label"], "sev": rule["sev"],
+                          "points": SEVERITY_POINTS[rule["sev"]],
+                          "category": rule["cat"]})
 
-    # Liquidity lock -- AnubisDAO pattern.
-    lp_locked = check_lp_lock(token)
-    if lp_locked is not None and lp_locked < 50:
-        flags.append({
-            "label": f"Only {lp_locked}% of liquidity is locked - the "
-                     f"deployer can pull the pool",
-            "weight": 20, "category": CAT_LIQUIDITY,
-            "thesis": "Sec 4.2 - AnubisDAO unlocked liquidity pool"})
+    secured = lp_holder_pct(token, "secured")
+    burned = lp_holder_pct(token, "burned")
+    locked = lp_holder_pct(token, "locked")
+    if secured is not None and secured < 50:
+        if secured <= 0:
+            lp_label = ("Liquidity is not locked or burned, so the deployer "
+                        "can pull the pool at any time")
+        else:
+            lp_label = (f"Only {secured}% of the liquidity is locked or burned, "
+                        f"so the deployer can still pull most of it")
+        flags.append({"label": lp_label, "sev": "high",
+                      "points": SEVERITY_POINTS["high"], "category": CAT_LIQUIDITY})
 
-    # Top-holder concentration -- insider / whale signal.
     top10 = top_holder_concentration(token)
     if top10 >= 70:
         flags.append({
-            "label": f"Top 10 wallets hold {top10}% of supply - extreme "
-                     f"concentration (insider / whale control)",
-            "weight": 20, "category": CAT_TOKENOMICS,
-            "thesis": "Sec 4.4 - insider concentration risk"})
+            "label": f"The top 10 wallets hold {top10}% of the supply "
+                     f"(extreme concentration, likely insider or whale control)",
+            "sev": "high", "points": SEVERITY_POINTS["high"],
+            "category": CAT_TOKENOMICS})
     elif top10 >= 50:
         flags.append({
-            "label": f"Top 10 wallets hold {top10}% of supply - high "
-                     f"concentration",
-            "weight": 10, "category": CAT_TOKENOMICS,
-            "thesis": "Sec 4.4 - insider concentration risk"})
+            "label": f"The top 10 wallets hold {top10}% of the supply "
+                     f"(high concentration)",
+            "sev": "medium", "points": SEVERITY_POINTS["medium"],
+            "category": CAT_TOKENOMICS})
 
-    # Creator holding -- insider signal.
     creator = pct(token, "creator_percent")
     if creator is not None and creator >= 5:
         flags.append({
-            "label": f"Creator wallet holds {creator}% of supply",
-            "weight": 10, "category": CAT_TOKENOMICS,
-            "thesis": "Sec 4.4 - insider concentration risk"})
+            "label": f"The creator wallet holds {creator}% of the supply",
+            "sev": "medium", "points": SEVERITY_POINTS["medium"],
+            "category": CAT_TOKENOMICS})
 
-    # Very high taxes -- soft honeypot.
+    owner = pct(token, "owner_percent")
+    if owner is not None and owner >= 5:
+        flags.append({
+            "label": f"The owner wallet holds {owner}% of the supply",
+            "sev": "medium", "points": SEVERITY_POINTS["medium"],
+            "category": CAT_TOKENOMICS})
+
     for tkey, name in (("buy_tax", "buy"), ("sell_tax", "sell")):
         t = pct(token, tkey)
         if t is not None and t >= 20:
             flags.append({
-                "label": f"Very high {name} tax: {t}%",
-                "weight": 10, "category": CAT_TOKENOMICS,
-                "thesis": "Sec 2.2 - hidden cost extraction"})
+                "label": f"Very high {name} tax of {t}%",
+                "sev": "medium", "points": SEVERITY_POINTS["medium"],
+                "category": CAT_TOKENOMICS})
+
+    mint_revoked = token.get("is_mintable")
+    freeze_revoked = token.get("transfer_pausable")
+    status = [
+        {"label": "Mint authority revoked",
+         "value": yesno(None if mint_revoked in (None, "") else mint_revoked == "0")},
+        {"label": "Freeze authority revoked",
+         "value": yesno(None if freeze_revoked in (None, "") else freeze_revoked == "0")},
+        {"label": "LP burned",
+         "value": yesno(None if burned is None else burned >= 50)},
+    ]
 
     return {
         "name": token.get("token_name") or "Unknown token",
         "symbol": token.get("token_symbol") or "?",
         "flags": flags,
         "unknown": unknown,
+        "status": status,
         "stats": {
             "holder_count": token.get("holder_count") or "n/a",
             "top10_percent": top10,
             "creator_percent": creator,
-            "lp_locked_percent": lp_locked,
+            "lp_secured_percent": secured,
         },
     }
 
 
-# ===========================================================================
-# PART 2 - CONTRACT CODE FETCH + ANALYSIS (Etherscan V2)
-# ===========================================================================
 CODE_PATTERNS = [
     {"name": "owner-gated upgrade switch",
      "regex": r"approveTo|upgradeTo|setImplementation|_upgradeTo",
-     "weight": 25,
-     "label": "Owner-gated upgrade switch (e.g. approveTo): admin can swap "
-              "the live contract logic at any time",
-     "thesis": "Sec 4.1.1 - SQUID approveTo / ifSir upgrade gate"},
+     "sev": "high",
+     "label": "An owner-gated upgrade switch lets the admin swap the live "
+              "contract logic at any time"},
 
     {"name": "delegatecall proxy",
      "regex": r"delegatecall",
-     "weight": 15,
-     "label": "delegatecall / proxy pattern: the real logic can live in a "
-              "hidden, swappable contract",
-     "thesis": "Sec 4.1.1 & 4.2 - SQUID proxy obfuscation"},
+     "sev": "medium",
+     "label": "A delegatecall proxy means the real logic can live in a "
+              "hidden, swappable contract"},
 
     {"name": "mint",
      "regex": r"function\s+\w*[mM]int\w*\s*\(",
-     "weight": 15,
-     "label": "Mint function: token supply can be inflated by the team",
-     "thesis": "Sec 2.2 - hidden-mint hard rug pull"},
+     "sev": "high",
+     "label": "A mint function lets the team increase the token supply"},
 
     {"name": "blacklist",
      "regex": r"[bB]lacklist|_isBlacklisted|denylist|_isBot|setBots",
-     "weight": 15,
-     "label": "Blacklist mechanism: specific wallets can be blocked from "
-              "selling (honeypot behaviour)",
-     "thesis": "Sec 2.2 - honeypot / sell-block mechanics"},
+     "sev": "high",
+     "label": "A blacklist lets the team block specific wallets from selling"},
 
-    {"name": "adjustable fee / tax",
+    {"name": "adjustable fee",
      "regex": r"function\s+\w*[sS]et\w*(Fee|Fees|Tax|Taxes)\w*\s*\(",
-     "weight": 12,
-     "label": "Adjustable fee/tax: sell tax can be raised arbitrarily "
-              "(soft honeypot)",
-     "thesis": "Sec 2.2 - hidden cost extraction"},
+     "sev": "medium",
+     "label": "An adjustable fee or tax can be raised by the team to trap sellers"},
+
+    {"name": "exclude from fee",
+     "regex": r"excludeFromFee|excludeFromFees|isExcludedFromFee",
+     "sev": "low",
+     "label": "The team can exempt its own wallets from fees"},
 
     {"name": "pause trading",
      "regex": r"function\s+\w*[pP]ause\w*\s*\(",
-     "weight": 12,
-     "label": "Pause function: the team can freeze all transfers/trading",
-     "thesis": "Sec 2.2 - team control over trading"},
+     "sev": "medium",
+     "label": "A pause function lets the team freeze all transfers and trading"},
 
-    {"name": "trading on/off switch",
+    {"name": "trading switch",
      "regex": r"enableTrading|openTrading|setTrading|tradingActive|"
               r"setTradingEnabled",
-     "weight": 10,
-     "label": "Trading on/off switch controlled by the team",
-     "thesis": "Sec 2.2 - team control over trading"},
+     "sev": "medium",
+     "label": "A trading on/off switch is controlled by the team"},
 
-    {"name": "adjustable max transaction / wallet",
+    {"name": "adjustable max",
      "regex": r"function\s+\w*[sS]etMax\w*\s*\(",
-     "weight": 8,
-     "label": "Adjustable max transaction/wallet limit: can be set to block "
-              "selling",
-     "thesis": "Sec 2.2 - trading restriction control"},
+     "sev": "low",
+     "label": "An adjustable max transaction or wallet limit can be set to "
+              "block selling"},
 
     {"name": "selfdestruct",
      "regex": r"selfdestruct",
-     "weight": 15,
-     "label": "selfdestruct: the contract can be destroyed",
-     "thesis": "Sec 4.5 - technical red flag"},
+     "sev": "high",
+     "label": "A self-destruct call can destroy the contract"},
 ]
 
 
 def fetch_source(chain_id, address, follow_proxy=True):
-    """
-    Fetch verified Solidity source from Etherscan V2.
-    Returns (source_string, status, contract_name).
-    status: 'ok' | 'no_key' | 'not_verified' | 'error'
-    """
     if not ETHERSCAN_API_KEY:
-        return "", "no_key", ""
-
+        return "", "no_key"
     params = urllib.parse.urlencode({
-        "chainid": chain_id,
-        "module": "contract",
-        "action": "getsourcecode",
-        "address": address,
+        "chainid": chain_id, "module": "contract",
+        "action": "getsourcecode", "address": address,
         "apikey": ETHERSCAN_API_KEY,
     })
     url = f"{ETHERSCAN_URL}?{params}"
@@ -344,32 +338,24 @@ def fetch_source(chain_id, address, follow_proxy=True):
     try:
         with urllib.request.urlopen(req, timeout=25) as resp:
             data = json.loads(resp.read().decode())
-    except Exception:  # noqa: BLE001
-        return "", "error", ""
-
+    except Exception:
+        return "", "error"
     if str(data.get("status")) != "1":
-        return "", "error", ""
-
+        return "", "error"
     res = (data.get("result") or [{}])[0]
     src = res.get("SourceCode") or ""
     if not src.strip():
-        return "", "not_verified", ""
-
-    name = res.get("ContractName", "")
-    # If this is a proxy, also fetch and append the implementation source,
-    # because that is where the real (possibly malicious) logic lives.
+        return "", "not_verified"
     if (follow_proxy and str(res.get("Proxy")) == "1"
             and str(res.get("Implementation", "")).startswith("0x")):
-        impl_src, _, _ = fetch_source(chain_id, res["Implementation"],
-                                      follow_proxy=False)
+        impl_src, _ = fetch_source(chain_id, res["Implementation"],
+                                   follow_proxy=False)
         if impl_src:
-            src = (src + "\n\n// ===== IMPLEMENTATION CONTRACT =====\n"
-                   + impl_src)
-    return src, "ok", name
+            src = src + "\n\n// IMPLEMENTATION\n" + impl_src
+    return src, "ok"
 
 
 def analyze_source(source):
-    """Scan Solidity source for dangerous patterns. Returns list of flags."""
     flags = []
     lines = source.splitlines()
     for pat in CODE_PATTERNS:
@@ -382,50 +368,45 @@ def analyze_source(source):
                 line_no = i
                 snippet = line.strip()[:120]
                 break
-        flags.append({
-            "label": pat["label"], "weight": pat["weight"],
-            "thesis": pat["thesis"], "category": CAT_CODE,
-            "line": line_no, "evidence": snippet,
-        })
+        flags.append({"label": pat["label"], "sev": pat["sev"],
+                      "points": SEVERITY_POINTS[pat["sev"]],
+                      "category": CAT_CODE, "line": line_no,
+                      "evidence": snippet})
     return flags
 
 
-# ===========================================================================
-# SCORING
-# ===========================================================================
-def verdict(score):
-    if score >= 60:
-        return "HIGH RISK", "Strong rug-pull signals. Do not invest."
-    if score >= 30:
-        return "MEDIUM RISK", "Several red flags. Investigate carefully."
+def score_and_verdict(flags):
+    points = sum(f["points"] for f in flags)
+    score = min(points, 100)
+    has_critical = any(f["sev"] == "critical" for f in flags)
+    if has_critical:
+        score = max(score, 85)
+    if score >= 70:
+        return score, "HIGH RISK", "Strong rug-pull signals. Treat as unsafe."
+    if score >= 40:
+        return score, "MEDIUM RISK", "Several warning signs. Investigate before trusting it."
     if score > 0:
-        return "LOW RISK", "Minor flags found. Stay cautious."
-    return "NO RED FLAGS", ("No technical red flags detected. NOTE: the social "
-                            "layer is not checked here - see thesis Sec 4.4.")
+        return score, "LOW RISK", "A few minor signs. Stay cautious."
+    return score, "NO RED FLAGS", "No technical red flags were detected on the checks that ran."
 
 
-def build_report(onchain, code_flags, code_status, name_hint=""):
-    """Merge on-chain flags + code flags into one scored report."""
+def build_report(onchain, code_flags, code_status):
     flags = list(onchain["flags"]) + list(code_flags)
-    score = min(sum(f["weight"] for f in flags), 100)
-    label, advice = verdict(score)
-    name = onchain.get("name") or name_hint or "Unknown token"
+    score, label, advice = score_and_verdict(flags)
     return {
-        "name": name,
+        "name": onchain.get("name", "Unknown token"),
         "symbol": onchain.get("symbol", "?"),
         "score": score,
         "verdict": label,
         "advice": advice,
         "flags": flags,
+        "status": onchain.get("status", []),
         "unknown": onchain.get("unknown", []),
         "stats": onchain.get("stats", {}),
         "code_status": code_status,
     }
 
 
-# ===========================================================================
-# DEMO DATA  (so the tool can be shown offline, e.g. live in your defense)
-# ===========================================================================
 DEMO_TOKEN = {
     "token_name": "Squid Game (offline demo sample)",
     "token_symbol": "SQUID",
@@ -434,9 +415,13 @@ DEMO_TOKEN = {
     "can_take_back_ownership": "1", "hidden_owner": "0",
     "owner_change_balance": "0", "selfdestruct": "0",
     "transfer_pausable": "1", "is_blacklisted": "0",
+    "honeypot_with_same_creator": "0", "is_airdrop_scam": "0",
+    "external_call": "0", "slippage_modifiable": "1",
+    "trading_cooldown": "0", "anti_whale_modifiable": "0",
     "buy_tax": "0", "sell_tax": "0.99", "holder_count": "102154",
-    "creator_percent": "0.12",
-    "lp_holders": [{"is_locked": 0, "percent": "0.92"}],
+    "creator_percent": "0.12", "owner_percent": "0",
+    "lp_holders": [{"is_locked": 0, "percent": "0.92",
+                    "address": "0x0000000000000000000000000000000000001234"}],
     "holders": [
         {"percent": "0.41"}, {"percent": "0.19"}, {"percent": "0.07"},
         {"percent": "0.05"}, {"percent": "0.03"}, {"percent": "0.02"},
@@ -446,8 +431,6 @@ DEMO_TOKEN = {
 }
 
 DEMO_SOURCE = """\
-// Squid Game Token - excerpt (thesis Figures 4.1 and 4.2)
-
 function approveTo(address newGame) external ifSir {
     _approveTo(newGame);
 }
@@ -465,9 +448,6 @@ function _delegate(address implementation) internal {
 """
 
 
-# ===========================================================================
-# ROUTES
-# ===========================================================================
 @app.route("/")
 def index():
     return render_template("index.html", has_key=bool(ETHERSCAN_API_KEY))
@@ -476,35 +456,29 @@ def index():
 @app.route("/api/scan", methods=["POST"])
 def api_scan():
     data = request.get_json(silent=True) or {}
-
-    # Offline demo: merge baked-in token data + baked-in SQUID code.
     if data.get("demo"):
         onchain = assess_token(DEMO_TOKEN)
-        code_flags = analyze_source(DEMO_SOURCE)
-        return jsonify(build_report(onchain, code_flags, "demo"))
+        return jsonify(build_report(onchain, analyze_source(DEMO_SOURCE), "demo"))
 
     address = (data.get("address") or "").strip()
-    chain = (data.get("chain") or "bsc").lower()
+    chain = (data.get("chain") or "ethereum").lower()
     if not address:
         return jsonify({"error": "Please enter a contract address."})
     if not re.fullmatch(r"0x[a-fA-F0-9]{40}", address):
         return jsonify({"error": "That doesn't look like a valid contract "
-                                 "address (it should be 0x + 40 characters)."})
+                                 "address (it should be 0x followed by 40 "
+                                 "characters)."})
     chain_id = CHAINS.get(chain)
     if not chain_id:
-        return jsonify({"error": f"Unsupported chain '{chain}'. Use BSC or "
-                                 f"Ethereum."})
+        return jsonify({"error": f"Unsupported chain '{chain}'. Use Ethereum "
+                                 f"or BSC."})
 
-    # 1) On-chain checks (GoPlus).
     token, err = fetch_token(chain_id, address)
     if err:
         return jsonify({"error": err})
     onchain = assess_token(token)
-
-    # 2) Auto-fetch + analyze the contract code (Etherscan V2).
-    source, code_status, _ = fetch_source(chain_id, address)
+    source, code_status = fetch_source(chain_id, address)
     code_flags = analyze_source(source) if source else []
-
     return jsonify(build_report(onchain, code_flags, code_status))
 
 
