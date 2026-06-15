@@ -205,24 +205,26 @@ function flagRow(f){
     '<span class="wt" style="color:'+col+'">+'+f.points+'</span></div>';
 }
 
-function codeStatusRow(status){
+function codeStatusRow(status, detail){
+  function info(color, text){ return '<div class="info"><span class="dot" style="background:'+color+'"></span>'+text+'</div>'; }
   if(status==='not_verified')
-    return '<div class="info"><span class="dot" style="background:var(--amber)"></span>'+
-      'The contract code is not verified on the explorer, so it cannot be read. That is itself a red flag.</div>';
+    return info('var(--amber)', 'The contract code is not verified on the explorer, so it cannot be read. That is itself a red flag.');
   if(status==='no_key')
-    return '<div class="info"><span class="dot" style="background:var(--gray)"></span>'+
-      'Code analysis is off (no API key set). The on-chain checks above still ran.</div>';
+    return info('var(--gray)', 'Code analysis is off (no API key set). The on-chain checks above still ran.');
+  if(status==='bad_key')
+    return info('var(--amber)', 'The Etherscan API key was rejected. Check the key on your host (Environment, ETHERSCAN_API_KEY). A brand-new key can take a few minutes to activate.');
+  if(status==='rate_limit')
+    return info('var(--amber)', 'The Etherscan rate limit was reached. Wait about a minute, then scan again.');
   if(status==='error')
-    return '<div class="info"><span class="dot" style="background:var(--gray)"></span>'+
-      'The contract code could not be fetched this time. Try again in a moment.</div>';
+    return info('var(--gray)', 'The contract code could not be fetched'+(detail? ' ('+esc(detail)+')':'')+'. Try again in a moment.');
   return '<div class="clear"><span class="dot" style="background:var(--green)"></span>'+
     'No risky code patterns were found.</div>';
 }
 
-function group(cat, flags, codeStatus){
+function group(cat, flags, codeStatus, codeDetail){
   const items = flags.filter(f => f.category === cat);
   let inner;
-  if(cat === "Contract code" && items.length === 0){ inner = codeStatusRow(codeStatus); }
+  if(cat === "Contract code" && items.length === 0){ inner = codeStatusRow(codeStatus, codeDetail); }
   else if(items.length === 0){
     inner = '<div class="clear"><span class="dot" style="background:var(--green)"></span>'+
       'Nothing flagged in this category.</div>';
@@ -255,12 +257,8 @@ function render(data){
     cell('Liquidity secured', s.lp_secured_percent!=null? s.lp_secured_percent+'%':'n/a')+
     '</div>';
 
-  CATS.forEach(c => html += group(c, data.flags||[], data.code_status));
+  CATS.forEach(c => html += group(c, data.flags||[], data.code_status, data.code_detail));
 
-  if(data.unknown && data.unknown.length){
-    html += '<div class="unknown">Some checks could not be run because the data source '+
-      'did not return them: '+ esc(data.unknown.join(', ')) +'.</div>';
-  }
   html += '</div>';
   el.innerHTML = html;
   el.scrollIntoView({behavior:'smooth', block:'start'});

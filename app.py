@@ -181,12 +181,10 @@ def yesno(condition):
 
 def assess_token(token):
     flags = []
-    unknown = []
 
     for rule in RULES:
         val = token.get(rule["key"])
         if val is None or val == "":
-            unknown.append(rule["name"])
             continue
         if str(val) == rule["trigger"]:
             flags.append({"label": rule["label"], "sev": rule["sev"],
@@ -257,7 +255,6 @@ def assess_token(token):
         "name": token.get("token_name") or "Unknown token",
         "symbol": token.get("token_symbol") or "?",
         "flags": flags,
-        "unknown": unknown,
         "status": status,
         "stats": {
             "holder_count": token.get("holder_count") or "n/a",
@@ -327,7 +324,7 @@ CODE_PATTERNS = [
 
 def fetch_source(chain_id, address, follow_proxy=True):
     if not ETHERSCAN_API_KEY:
-        return "", "no_key"
+        return "", "no_key", ""
     params = urllib.parse.urlencode({
         "chainid": chain_id, "module": "contract",
         "action": "getsourcecode", "address": address,
@@ -339,20 +336,28 @@ def fetch_source(chain_id, address, follow_proxy=True):
         with urllib.request.urlopen(req, timeout=25) as resp:
             data = json.loads(resp.read().decode())
     except Exception:
-        return "", "error"
+        return "", "error", "network or timeout error"
     if str(data.get("status")) != "1":
-        return "", "error"
+        reason = data.get("result")
+        if not isinstance(reason, str):
+            reason = data.get("message") or "unknown error"
+        low = reason.lower()
+        if "invalid" in low and "key" in low:
+            return "", "bad_key", reason
+        if "rate limit" in low or "max rate" in low or "max calls" in low:
+            return "", "rate_limit", reason
+        return "", "error", reason
     res = (data.get("result") or [{}])[0]
     src = res.get("SourceCode") or ""
     if not src.strip():
-        return "", "not_verified"
+        return "", "not_verified", ""
     if (follow_proxy and str(res.get("Proxy")) == "1"
             and str(res.get("Implementation", "")).startswith("0x")):
-        impl_src, _ = fetch_source(chain_id, res["Implementation"],
-                                   follow_proxy=False)
+        impl_src, _, _ = fetch_source(chain_id, res["Implementation"],
+                                      follow_proxy=False)
         if impl_src:
             src = src + "\n\n// IMPLEMENTATION\n" + impl_src
-    return src, "ok"
+    return src, "ok", ""
 
 
 def analyze_source(source):
@@ -390,7 +395,7 @@ def score_and_verdict(flags):
     return score, "NO RED FLAGS", "No technical red flags were detected on the checks that ran."
 
 
-def build_report(onchain, code_flags, code_status):
+def build_report(onchain, code_flags, code_status, code_detail=""):
     flags = list(onchain["flags"]) + list(code_flags)
     score, label, advice = score_and_verdict(flags)
     return {
@@ -401,9 +406,9 @@ def build_report(onchain, code_flags, code_status):
         "advice": advice,
         "flags": flags,
         "status": onchain.get("status", []),
-        "unknown": onchain.get("unknown", []),
         "stats": onchain.get("stats", {}),
         "code_status": code_status,
+        "code_detail": code_detail,
     }
 
 
@@ -477,9 +482,9 @@ def api_scan():
     if err:
         return jsonify({"error": err})
     onchain = assess_token(token)
-    source, code_status = fetch_source(chain_id, address)
+    source, code_status, code_detail = fetch_source(chain_id, address)
     code_flags = analyze_source(source) if source else []
-    return jsonify(build_report(onchain, code_flags, code_status))
+    return jsonify(build_report(onchain, code_flags, code_status, code_detail))
 
 
 if __name__ == "__main__":
