@@ -256,7 +256,7 @@ function render(data){
     cell('Holders', s.holder_count!=null? s.holder_count : 'n/a')+
     cell('Top 10 hold', s.top10_percent!=null? s.top10_percent+'%':'n/a')+
     cell('Creator holds', s.creator_percent!=null? s.creator_percent+'%':'n/a')+
-    cell('Liquidity secured', s.lp_secured_percent!=null? s.lp_secured_percent+'%':'n/a')+
+    cell('Liquidity locked', s.lp_secured_percent!=null? s.lp_secured_percent+'%':'n/a')+
     '</div>';
 
   const honeypotFlagged = (data.flags||[]).some(f => /honeypot|cannot sell|sell restriction|blacklist/i.test(f.label));
