@@ -279,9 +279,10 @@ CODE_PATTERNS = [
               "hidden, swappable contract"},
 
     {"name": "mint",
-     "regex": r"function\s+\w*[mM]int\w*\s*\(",
+     "regex": r"function\s+(?!_)\w*[mM]int\w*\s*\([^)]*\)[^{;]*\b(?:public|external)\b",
      "sev": "high",
-     "label": "A mint function lets the team increase the token supply"},
+     "label": "An externally callable mint function lets the team increase the "
+              "token supply"},
 
     {"name": "blacklist",
      "regex": r"[bB]lacklist|_isBlacklisted|denylist|_isBot|setBots",
