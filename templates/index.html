@@ -205,7 +205,7 @@ function flagRow(f){
     '<span class="wt" style="color:'+col+'">+'+f.points+'</span></div>';
 }
 
-function codeStatusRow(status, detail){
+function codeStatusRow(status, detail, honeypotFlagged){
   function info(color, text){ return '<div class="info"><span class="dot" style="background:'+color+'"></span>'+text+'</div>'; }
   if(status==='not_verified')
     return info('var(--amber)', 'The contract code is not verified on the explorer, so it cannot be read. That is itself a red flag.');
@@ -217,14 +217,16 @@ function codeStatusRow(status, detail){
     return info('var(--amber)', 'The Etherscan rate limit was reached. Wait about a minute, then scan again.');
   if(status==='error')
     return info('var(--gray)', 'The contract code could not be fetched'+(detail? ' ('+esc(detail)+')':'')+'. Try again in a moment.');
+  if(honeypotFlagged)
+    return info('var(--amber)', 'No matching patterns were found in the readable source, but the on-chain test detected a sell block. The trap is likely obfuscated or kept in a part of the contract this scan cannot read.');
   return '<div class="clear"><span class="dot" style="background:var(--green)"></span>'+
     'No risky code patterns were found.</div>';
 }
 
-function group(cat, flags, codeStatus, codeDetail){
+function group(cat, flags, codeStatus, codeDetail, honeypotFlagged){
   const items = flags.filter(f => f.category === cat);
   let inner;
-  if(cat === "Contract code" && items.length === 0){ inner = codeStatusRow(codeStatus, codeDetail); }
+  if(cat === "Contract code" && items.length === 0){ inner = codeStatusRow(codeStatus, codeDetail, honeypotFlagged); }
   else if(items.length === 0){
     inner = '<div class="clear"><span class="dot" style="background:var(--green)"></span>'+
       'Nothing flagged in this category.</div>';
@@ -257,7 +259,8 @@ function render(data){
     cell('Liquidity secured', s.lp_secured_percent!=null? s.lp_secured_percent+'%':'n/a')+
     '</div>';
 
-  CATS.forEach(c => html += group(c, data.flags||[], data.code_status, data.code_detail));
+  const honeypotFlagged = (data.flags||[]).some(f => /honeypot|cannot sell|sell restriction|blacklist/i.test(f.label));
+  CATS.forEach(c => html += group(c, data.flags||[], data.code_status, data.code_detail, honeypotFlagged));
 
   html += '</div>';
   el.innerHTML = html;
